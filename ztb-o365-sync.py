@@ -1,65 +1,57 @@
 #!/usr/bin/env python3
 """
-ZTB Microsoft 365 Object & Security Policy Automation
-Compatible with Mike Dechow's ztb-objects-bulk repository pattern.
-
-Fetches O365 IPs, FQDNs, and Ports from Microsoft's web service / Learn pages,
-generates pipe-delimited CSVs for bulk ingestion, and uses ZTB REST APIs to
-provision Network Objects and Security Policies.
+Zscaler Zero Trust Branch (ZTB) - Microsoft 365 Category & Umbrella Group Sync
+==============================================================================
+Synchronizes Microsoft 365 endpoints into dedicated category child groups
+(Exchange, SharePoint, Skype/Teams, Common) and nests them into Master Umbrella
+FQDN and IP groups. The master groups reference ONLY child member groups, 
+with zero direct/duplicate leaf entries.
 """
 
 import os
 import re
-import csv
-import json
+import sys
 import uuid
 import ipaddress
 import requests
-from bs4 import BeautifulSoup
-from dotenv import load_dotenv
-
-load_dotenv()
 
 # ==============================================================================
-# CONFIGURATION
+# CONFIGURATION & ENVIRONMENT VALIDATION
 # ==============================================================================
-# Read strictly from exported environment variables (no placeholder fallback)
-ZTB_BASE_URL = os.getenv("ZTB_BASE_URL")
+ZTB_BASE_URL = os.environ.get("ZTB_BASE_URL")
 if not ZTB_BASE_URL:
     raise ValueError(
-        "Missing required environment variable: ZTB_BASE_URL is not set.\n"
-        "Export it in your shell or .env: export ZTB_BASE_URL='https://<tenant>-api.goairgap.com'"
+        "Missing required environment variable: ZTB_BASE_URL.\n"
+        "Export it: export ZTB_BASE_URL='https://<tenant>-api.goairgap.com'"
     )
 ZTB_BASE_URL = ZTB_BASE_URL.rstrip("/")
-ZTB_UI_ORIGIN = ZTB_BASE_URL.replace("-api.", ".")
+ZTB_UI_ORIGIN = os.environ.get("ZTB_UI_ORIGIN", ZTB_BASE_URL.replace("-api.", "."))
 
-ZTB_API_KEY = os.getenv("ZTB_API_KEY")
+ZTB_API_KEY = os.environ.get("ZTB_API_KEY")
 if not ZTB_API_KEY:
     raise ValueError(
-        "Missing required environment variable: ZTB_API_KEY is not set.\n"
-        "Export it in your shell or .env: export ZTB_API_KEY='<your_api_key>'"
+        "Missing required environment variable: ZTB_API_KEY.\n"
+        "Export it: export ZTB_API_KEY='<your_api_key>'"
     )
 
-# Site and Group settings
-# If ZTB_SITE_ID is unset or left as placeholder, security policies default to 'global' (site_id=None)
-SITE_ID = os.getenv("ZTB_SITE_ID")
-if SITE_ID in ("", "YOUR_SITE_UUID"):
-    SITE_ID = None
-
-SRC_GROUP_ID = int(os.getenv("ZTB_SRC_GROUP_ID", "2"))  # 2 = System-All-Networks-Group ("ZTB Network")
-
-MS_LEARN_URL = "https://learn.microsoft.com/en-us/microsoft-365/enterprise/urls-and-ip-address-ranges?view=o365-worldwide"
 MS_WEB_SERVICE_URL = "https://endpoints.office.com/endpoints/worldwide"
 
+SERVICE_AREAS = {
+    "Exchange": "O365-Exchange",
+    "SharePoint": "O365-SharePoint",
+    "Skype": "O365-Teams-Skype",
+    "Common": "O365-Common",
+}
+
+MASTER_FQDN_GROUP_NAME = "O365-Master-FQDN-Group"
+MASTER_IP_GROUP_NAME = "O365-Master-IP-Group"
+
 
 # ==============================================================================
-# 1. PARSING & EXTRACTION HELPERS
+# 1. PARSING & SANITIZATION HELPERS
 # ==============================================================================
 def normalize_ipv4_cidr(ip_str: str) -> str | None:
-    """
-    Validates IPv4 network string and guarantees CIDR notation (/32 for single hosts).
-    Crucial for ZTB: API stores raw strings; missing mask causes silent match failure.
-    """
+    """Validates IPv4 network string and guarantees strict CIDR notation (/32 for hosts)."""
     ip_str = ip_str.strip()
     try:
         net = ipaddress.ip_network(ip_str, strict=False)
@@ -71,12 +63,7 @@ def normalize_ipv4_cidr(ip_str: str) -> str | None:
 
 
 def normalize_fqdn(raw: str) -> str | None:
-    """
-    Normalizes Microsoft URLs/FQDNs to comply with ZTB FQDN validation rules:
-    - Replaces patterns like '*xxx.yyy.zzz' with '*.yyy.zzz' (wildcarding the entire first word).
-    - Strips http://, https://, URL paths, and port suffixes.
-    - Discards invalid characters or internal wildcards (e.g. foo.*.com).
-    """
+    """Normalizes Microsoft URLs/FQDNs to comply with ZTB regex rules."""
     cleaned = raw.strip().lower()
     if cleaned.startswith("http://"):
         cleaned = cleaned[7:]
@@ -87,147 +74,68 @@ def normalize_fqdn(raw: str) -> str | None:
     if not cleaned or "." not in cleaned:
         return None
 
-    # Replace *xxx.yyy.zzz with *.yyy.zzz (effectively wildcard the entire first word)
     if cleaned.startswith("*") and not cleaned.startswith("*."):
         cleaned = re.sub(r"^\*[^.]+\.", "*.", cleaned)
 
-    # Discard if internal wildcard exists (e.g. foo.*.com) or invalid
     if cleaned.count("*") > 1 or ("*" in cleaned and not cleaned.startswith("*.")):
         return None
 
     return cleaned
 
 
-def fetch_o365_endpoints(categories=("Optimize", "Allow"), include_required=True) -> dict:
-    """
-    Fetches official Microsoft endpoints JSON feed with fallback to HTML parsing.
-    Extracts all endpoints marked as 'Required' as well as endpoints in Optimize and Allow categories.
-    """
+def fetch_and_categorize_o365(categories=("Optimize", "Allow"), include_required=True) -> dict:
+    """Fetches Microsoft endpoints and partitions them strictly by serviceArea."""
     client_req_id = str(uuid.uuid4())
     url = f"{MS_WEB_SERVICE_URL}?clientRequestId={client_req_id}"
     print(f"[*] Querying Microsoft Web Service API: {url}")
 
-    ipv4_set, fqdn_set, tcp_ports, udp_ports = set(), set(), set(), set()
+    categorized = {area: {"ips": set(), "fqdns": set()} for area in SERVICE_AREAS.keys()}
 
     try:
         resp = requests.get(url, timeout=30)
         resp.raise_for_status()
         records = resp.json()
+    except requests.exceptions.RequestException as exc:
+        sys.exit(f"[!] Failed to fetch Microsoft 365 endpoints: {exc}")
 
-        for ep in records:
-            is_req = ep.get("required", False) is True
-            is_cat = ep.get("category") in categories if categories else False
+    for ep in records:
+        is_req = ep.get("required", False) is True
+        is_cat = ep.get("category") in categories if categories else False
 
-            # Include if marked as required OR belongs to specified categories (Optimize / Allow)
-            if include_required:
-                if not (is_req or is_cat):
-                    continue
-            else:
-                if categories and not is_cat:
-                    continue
-
-            for ip in ep.get("ips", []):
-                cidr = normalize_ipv4_cidr(ip)
-                if cidr:
-                    ipv4_set.add(cidr)
-
-            for url_entry in ep.get("urls", []):
-                norm = normalize_fqdn(url_entry)
-                if norm:
-                    fqdn_set.add(norm)
-
-            if ep.get("tcpPorts"):
-                for p in ep["tcpPorts"].split(","):
-                    p = p.strip()
-                    if p:
-                        tcp_ports.add(p)
-
-            if ep.get("udpPorts"):
-                for p in ep["udpPorts"].split(","):
-                    p = p.strip()
-                    if p:
-                        udp_ports.add(p)
-
-    except Exception as e:
-        print(f"[!] Web service API query failed ({e}). Falling back to HTML scraping...")
-        h_resp = requests.get(MS_LEARN_URL, timeout=30)
-        h_resp.raise_for_status()
-        soup = BeautifulSoup(h_resp.text, "html.parser")
-
-        for table in soup.find_all("table"):
-            headers = [th.get_text(strip=True).lower() for th in table.find_all("th")]
-            if "id" not in headers:
+        if include_required:
+            if not (is_req or is_cat):
                 continue
-            col_map = {h: idx for idx, h in enumerate(headers)}
+        else:
+            if categories and not is_cat:
+                continue
 
-            for row in table.find_all("tr")[1:]:
-                cells = row.find_all(["td", "th"])
-                if len(cells) < len(headers):
-                    continue
+        service_area = ep.get("serviceArea", "Common")
+        if service_area not in categorized:
+            service_area = "Common"
 
-                req_val = cells[col_map.get("required", -1)].get_text(strip=True).lower() if "required" in col_map else ""
-                is_req = req_val in ("yes", "true", "required")
+        for raw_ip in ep.get("ips", []):
+            cidr = normalize_ipv4_cidr(raw_ip)
+            if cidr:
+                categorized[service_area]["ips"].add(cidr)
 
-                cat_val = cells[col_map.get("category", -1)].get_text(strip=True).lower() if "category" in col_map else ""
-                is_cat = any(c.lower() in cat_val for c in categories) if categories else False
+        for raw_url in ep.get("urls", []):
+            norm = normalize_fqdn(raw_url)
+            if norm:
+                categorized[service_area]["fqdns"].add(norm)
 
-                if include_required:
-                    if not (is_req or is_cat):
-                        continue
-                else:
-                    if categories and not is_cat:
-                        continue
+    result = {}
+    for area, data in categorized.items():
+        result[area] = {
+            "ips": sorted(data["ips"]),
+            "fqdns": sorted(data["fqdns"]),
+        }
+        print(f"    - {area}: {len(result[area]['fqdns'])} FQDNs, {len(result[area]['ips'])} IPv4 CIDRs")
 
-                addr_text = cells[col_map.get("addresses", -1)].get_text(" ", strip=True)
-                for token in re.split(r"[\s,;]+", addr_text):
-                    cidr = normalize_ipv4_cidr(token)
-                    if cidr:
-                        ipv4_set.add(cidr)
-                    elif ":" not in token and "." in token:
-                        norm = normalize_fqdn(token)
-                        if norm:
-                            fqdn_set.add(norm)
-
-                ports_text = cells[col_map.get("ports", -1)].get_text(" ", strip=True)
-                t_match = re.search(r"TCP:\s*([0-9,\-\s]+)", ports_text, re.I)
-                u_match = re.search(r"UDP:\s*([0-9,\-\s]+)", ports_text, re.I)
-                if t_match:
-                    for p in re.split(r"[\s,]+", t_match.group(1).strip()):
-                        if p:
-                            tcp_ports.add(p)
-                if u_match:
-                    for p in re.split(r"[\s,]+", u_match.group(1).strip()):
-                        if p:
-                            udp_ports.add(p)
-
-    return {
-        "ips": sorted(ipv4_set),
-        "fqdns": sorted(fqdn_set),
-        "tcp_ports": sorted(tcp_ports),
-        "udp_ports": sorted(udp_ports),
-    }
+    return result
 
 
 # ==============================================================================
-# 2. EXPORT COMPATIBILITY FOR ztb-objects-bulk (CSV EXPORT)
-# ==============================================================================
-def export_pipe_delimited_csv(filename: str, objects: list[dict]):
-    """
-    Exports objects using the pipe (|) delimiter required by ZTB CSV ingestion
-    and Mike Dechow's ztb-objects-bulk ingestion format.
-    Format: Name|Type|Values
-    """
-    print(f"[*] Exporting bulk object file to {filename} (pipe-delimited)...")
-    with open(filename, mode="w", newline="", encoding="utf-8") as f:
-        writer = csv.writer(f, delimiter="|")
-        writer.writerow(["name", "type", "values"])
-        for obj in objects:
-            writer.writerow([obj["name"], obj["type"], ",".join(obj["values"])])
-    print(f"[+] Successfully wrote {len(objects)} object rows to {filename}.")
-
-
-# ==============================================================================
-# 3. ZTB REST API CLIENT
+# 2. ZTB REST API CLIENT
 # ==============================================================================
 class ZTBClient:
     def __init__(self, api_base: str, api_key: str, ui_origin: str):
@@ -235,7 +143,7 @@ class ZTBClient:
         self.api_key = api_key
         self.ui_origin = ui_origin
         self.session = requests.Session()
-        self.token = None
+        self.group_cache = {}
 
     def authenticate(self):
         """Exchange API Key for Bearer delegate token and set headers."""
@@ -249,25 +157,17 @@ class ZTBClient:
         }
         try:
             resp = self.session.post(auth_url, json={"api_key": self.api_key}, headers=headers, timeout=15)
-            if resp.status_code >= 400:
-                print(f"[!] Auth Failed ({resp.status_code}): {resp.text}")
             resp.raise_for_status()
-        except requests.exceptions.ConnectionError:
-            print(f"\n[!] Connection Error: Unable to resolve or connect to '{self.api_base}'.")
-            print("    Please check that ZTB_BASE_URL points to your live tenant API endpoint")
-            print("    (e.g., https://<tenant>-api.goairgap.com) and that DNS resolution works.\n")
-            raise SystemExit(1) from None
-        except requests.exceptions.HTTPError as exc:
-            print(f"\n[!] Authentication HTTP Error ({exc.response.status_code}): {exc.response.text}\n")
-            raise SystemExit(1) from None
+        except requests.exceptions.RequestException as exc:
+            sys.exit(f"\n[!] ZTB Authentication Error: {exc}\n")
 
         data = resp.json()
-        self.token = data.get("result", {}).get("delegate_token") or data.get("delegate_token")
-        if not self.token:
-            raise RuntimeError(f"Missing delegate_token in response: {data}")
+        token = data.get("result", {}).get("delegate_token") or data.get("delegate_token")
+        if not token:
+            sys.exit(f"[!] Missing delegate_token in response: {data}")
 
         self.session.headers.update({
-            "Authorization": f"Bearer {self.token}",
+            "Authorization": f"Bearer {token}",
             "Content-Type": "application/json",
             "Accept": "application/json, text/plain, */*",
             "Origin": self.ui_origin,
@@ -276,211 +176,176 @@ class ZTBClient:
         })
         print("[+] Authenticated to ZTB Management API.")
 
-    def upsert_group(self, name: str, group_type: str, member_attributes: dict) -> int:
-        """Create or update group object via /api/v2/groups."""
+    def load_all_existing_groups(self):
+        """Preloads existing groups into cache for conflict-free resolution."""
+        self.group_cache.clear()
         get_url = f"{self.api_base}/api/v2/groups"
-        params = {"group_type": group_type, "group_owner": "user", "size": 500, "page": 0}
-        resp = self.session.get(get_url, params=params, timeout=20)
-        resp.raise_for_status()
+        params = {"size": 1000, "page": 0}
 
-        groups_list = resp.json().get("result", resp.json() if isinstance(resp.json(), list) else [])
-        existing_id = None
-        for g in groups_list:
-            if g.get("name") == name or g.get("display_name") == name:
-                existing_id = g.get("group_id")
-                break
+        try:
+            resp = self.session.get(get_url, params=params, timeout=20)
+            resp.raise_for_status()
+            groups_list = resp.json().get("result", resp.json() if isinstance(resp.json(), list) else [])
+            for g in groups_list:
+                name = g.get("name") or g.get("display_name")
+                gid = g.get("group_id")
+                if name and gid:
+                    self.group_cache[name] = gid
+            print(f"[*] Pre-loaded {len(self.group_cache)} existing groups from ZTB.")
+        except requests.exceptions.RequestException as exc:
+            print(f"[!] Warning: Could not pre-cache existing groups ({exc}).")
+
+    def upsert_network_group(self, name: str, member_attributes: dict, member_groups: str = "") -> int:
+        """
+        Creates or updates a network group. Supports top-level 'member_groups' string.
+        """
+        existing_id = self.group_cache.get(name)
 
         payload = {
             "name": name,
             "display_name": name,
-            "type": group_type,
+            "type": "network",
             "autonomous": False,
             "hidden": False,
             "owner": "user",
             "member_attributes": member_attributes,
         }
 
+        # Include top-level member_groups for umbrella parent groups
+        if member_groups:
+            payload["member_groups"] = member_groups
+
+        # 1. Update existing group
         if existing_id:
-            print(f"[*] Updating existing {group_type} '{name}' (ID: {existing_id})...")
+            print(f"[*] Updating existing group '{name}' (ID: {existing_id})...")
             url = f"{self.api_base}/api/v2/groups/{existing_id}?refresh_token=enabled"
-            r = self.session.put(url, json=payload, timeout=30)
-            if r.status_code >= 400:
-                print(f"[!] Group update error ({r.status_code}): {r.text}")
-            r.raise_for_status()
-            return existing_id
-        else:
-            print(f"[*] Creating new {group_type} '{name}'...")
-            url = f"{self.api_base}/api/v2/groups?refresh_token=enabled"
-            r = self.session.post(url, json=payload, timeout=30)
-            if r.status_code >= 400:
-                print(f"[!] Group creation error ({r.status_code}): {r.text}")
-            r.raise_for_status()
-            res_data = r.json().get("result", r.json())
-            group_id = res_data.get("group_id")
-            print(f"[+] Created object '{name}' (ID: {group_id}).")
-            return group_id
+            try:
+                r = self.session.put(url, json=payload, timeout=30)
+                if r.status_code >= 400:
+                    print(f"[!] PUT error payload ({r.status_code}): {r.text}")
+                r.raise_for_status()
+                print(f"[+] Successfully updated '{name}' (ID: {existing_id}).")
+                return existing_id
+            except requests.exceptions.HTTPError:
+                print(f"[!] PUT failed for '{name}'. Retrying with fresh lookup...")
 
-    def get_security_policies(self, policy_type: str = "global", site_id: str | None = None) -> list[dict]:
-        """Queries existing security policies to detect duplicates and conflicts."""
-        url = f"{self.api_base}/api/v2/group-policies"
-        params = {"type": policy_type, "size": 500, "page": 0}
-        if site_id:
-            params["site_id"] = site_id
-            params["type"] = "user"
-        try:
-            resp = self.session.get(url, params=params, timeout=20)
-            resp.raise_for_status()
-            data = resp.json()
-            if isinstance(data, list):
-                return data
-            return data.get("result", [])
-        except Exception as e:
-            print(f"[!] Note: Could not query existing policies ({e}). Proceeding...")
-            return []
-
-    def create_security_policy(
-        self,
-        name: str,
-        src_ids: list[int],
-        dst_ids: list[int],
-        port_group_id: int,
-        site_id: str | None = None,
-        sequence_number: int = 1,
-    ):
-        """
-        Upserts security policy with duplicate detection and conflict avoidance.
-        If a policy with the same name exists, it updates it via PUT /api/v2/group-policies/{id};
-        otherwise it creates it via POST /api/v2/group-policies/bulk.
-        """
-        actual_site_id = site_id if (site_id and site_id != "YOUR_SITE_UUID") else None
-        policy_type = "user" if actual_site_id else "global"
-
-        # 1. Detection: check if a policy with this name already exists
-        existing_list = self.get_security_policies(policy_type=policy_type, site_id=actual_site_id)
-        existing_policy = None
-        for item in existing_list:
-            p_data = item.get("policy", item)
-            if p_data.get("name") == name or p_data.get("display_name") == name:
-                existing_policy = p_data
-                break
-
-        policy_payload = {
-            "sequence_number": existing_policy.get("sequence_number", sequence_number) if existing_policy else sequence_number,
-            "name": name,
-            "display_name": name,
-            "src_group_negate": False,
-            "src_group_id_set": src_ids,
-            "dst_group_id_set": dst_ids,
-            "dst_group_negate": False,
-            "action": "accept",
-            "site_id": actual_site_id,
-            "dst_port_group_id": port_group_id,
-            "dst_port_group_negate": False,
-            "ts_group_id": 0,
-            "type": policy_type,
-            "log_enabled": True,
-            "rks": {
-                "green": True,
-                "yellow": True,
-                "orange": True,
-                "red": True,
-            },
-        }
-
-        # 2. Avoidance & Update: if policy exists, update via PUT
-        if existing_policy:
-            pol_id = existing_policy.get("policy_id") or existing_policy.get("id")
-            print(f"[*] Policy '{name}' already exists (ID: {pol_id}). Updating policy criteria...")
-            put_url = f"{self.api_base}/api/v2/group-policies/{pol_id}?refresh_token=enabled"
-            r = self.session.put(put_url, json=policy_payload, timeout=30)
-            if r.status_code >= 400:
-                print(f"[!] Policy update warning ({r.status_code}): {r.text}")
-                print(f"[+] Reusing existing policy '{name}'. Referenced network/port objects have been refreshed.")
-                return existing_policy
-            print(f"[+] Successfully updated Security Policy '{name}' (ID: {pol_id}).")
-            return r.json()
-
-        # 3. Creation: create new policy if not found
-        url = f"{self.api_base}/api/v2/group-policies/bulk"
-        payload = [policy_payload]
-        print(f"[*] Creating Security Policy '{name}' (Scope: {policy_type}, Site: {actual_site_id})...")
+        # 2. Create new group
+        print(f"[*] Creating group '{name}'...")
+        url = f"{self.api_base}/api/v2/groups?refresh_token=enabled"
         r = self.session.post(url, json=payload, timeout=30)
+
+        # 3. Handle 409 Conflict fallback
         if r.status_code == 409:
-            print(f"[*] Policy '{name}' already exists (409 Conflict handled). Referenced objects are updated.")
-            return {"status": "already_exists", "name": name}
+            print(f"[*] Conflict (409) detected for '{name}'. Refreshing group cache...")
+            self.load_all_existing_groups()
+            existing_id = self.group_cache.get(name)
+            if existing_id:
+                put_url = f"{self.api_base}/api/v2/groups/{existing_id}?refresh_token=enabled"
+                put_resp = self.session.put(put_url, json=payload, timeout=30)
+                if put_resp.status_code >= 400:
+                    print(f"[!] PUT retry error ({put_resp.status_code}): {put_resp.text}")
+                put_resp.raise_for_status()
+                print(f"[+] Successfully updated '{name}' (ID: {existing_id}).")
+                return existing_id
+            else:
+                sys.exit(f"[!] 409 Conflict received, but group '{name}' was not found in group list.")
+
         if r.status_code >= 400:
-            print(f"[!] Security Policy creation error ({r.status_code}) on {url}:")
-            print(f"    Server response payload: {r.text}")
+            print(f"[!] Group creation error ({r.status_code}): {r.text}")
         r.raise_for_status()
-        print(f"[+] Security Policy '{name}' established.")
-        return r.json()
+
+        res_data = r.json().get("result", r.json())
+        new_id = res_data.get("group_id")
+        self.group_cache[name] = new_id
+        print(f"[+] Successfully created network group '{name}' (ID: {new_id}).")
+        return new_id
 
 
 # ==============================================================================
-# MAIN EXECUTION ROUTINE
+# 3. MAIN EXECUTION ROUTINE
 # ==============================================================================
 def main():
-    # 1. Fetch Microsoft Endpoints (Include all Required endpoints, plus Optimize & Allow categories)
-    o365 = fetch_o365_endpoints(categories=("Optimize", "Allow"), include_required=True)
-    print(f"[+] Extracted: {len(o365['ips'])} CIDRs, {len(o365['fqdns'])} FQDNs, "
-          f"{len(o365['tcp_ports'])} TCP ports, {len(o365['udp_ports'])} UDP ports.")
+    print("====================================================================")
+    print(" ZTB Microsoft 365 Category Child & Umbrella Group Provisioning")
+    print("====================================================================")
 
-    # 2. Export pipe-delimited CSV for Mike Dechow's ztb-objects-bulk pattern
-    bulk_objects = [
-        {"name": "O365-Required-IPs", "type": "network", "values": o365["ips"]},
-        {"name": "O365-Required-FQDNs", "type": "network", "values": o365["fqdns"]},
-    ]
-    export_pipe_delimited_csv("ztb_o365_network_objects.csv", bulk_objects)
+    # 1. Fetch & Categorize Microsoft 365 Endpoints
+    categorized = fetch_and_categorize_o365(categories=("Optimize", "Allow"), include_required=True)
 
-    # 3. Direct ZTB REST API Execution
+    # 2. Authenticate and initialize group cache
     ztb = ZTBClient(ZTB_BASE_URL, ZTB_API_KEY, ZTB_UI_ORIGIN)
     ztb.authenticate()
+    ztb.load_all_existing_groups()
 
-    # Create IP Network Object
-    ip_group_id = ztb.upsert_group(
-        name="O365-Required-IPs",
-        group_type="network",
+    created_fqdn_child_names = []
+    created_ip_child_names = []
+
+    # 3. Provision Category Child Groups (Leaf Groups holding raw entries)
+    print("\n[*] Provisioning Category Child Groups...")
+    for area_key, prefix in SERVICE_AREAS.items():
+        area_fqdns = categorized[area_key]["fqdns"]
+        area_ips = categorized[area_key]["ips"]
+
+        # Category FQDN Child Group
+        fqdn_child_name = f"{prefix}-FQDN"
+        if area_fqdns:
+            ztb.upsert_network_group(
+                name=fqdn_child_name,
+                member_attributes={
+                    "ip_prefix": [],
+                    "ip_prefix_local": [],
+                    "fqdn": area_fqdns,
+                    "fqdn_local": area_fqdns,
+                },
+            )
+            created_fqdn_child_names.append(fqdn_child_name)
+
+        # Category IP Child Group
+        ip_child_name = f"{prefix}-IP"
+        if area_ips:
+            ztb.upsert_network_group(
+                name=ip_child_name,
+                member_attributes={
+                    "ip_prefix": area_ips,
+                    "ip_prefix_local": area_ips,
+                    "fqdn": [],
+                    "fqdn_local": [],
+                },
+            )
+            created_ip_child_names.append(ip_child_name)
+
+    # 4. Provision Master Umbrella Groups (Containing ONLY member groups)
+    print("\n[*] Provisioning Master Umbrella Groups (Member Groups Only)...")
+
+    # Master FQDN Umbrella Group: empty leaf lists, only top-level member_groups
+    fqdn_members_csv = ",".join(created_fqdn_child_names)
+    ztb.upsert_network_group(
+        name=MASTER_FQDN_GROUP_NAME,
+        member_groups=fqdn_members_csv,
         member_attributes={
-            "ip_prefix": o365["ips"],
-            "ip_prefix_local": o365["ips"],
+            "ip_prefix": [],
+            "ip_prefix_local": [],
             "fqdn": [],
             "fqdn_local": [],
         },
     )
+    print(f"[+] Master FQDN Umbrella '{MASTER_FQDN_GROUP_NAME}' updated with member groups only: {fqdn_members_csv}")
 
-    # Create FQDN Network Object
-    fqdn_group_id = ztb.upsert_group(
-        name="O365-Required-FQDNs",
-        group_type="network",
+    # Master IP Umbrella Group: empty leaf lists, only top-level member_groups
+    ip_members_csv = ",".join(created_ip_child_names)
+    ztb.upsert_network_group(
+        name=MASTER_IP_GROUP_NAME,
+        member_groups=ip_members_csv,
         member_attributes={
             "ip_prefix": [],
             "ip_prefix_local": [],
-            "fqdn": o365["fqdns"],
-            "fqdn_local": o365["fqdns"],
+            "fqdn": [],
+            "fqdn_local": [],
         },
     )
+    print(f"[+] Master IP Umbrella '{MASTER_IP_GROUP_NAME}' updated with member groups only: {ip_members_csv}")
 
-    # Create L4 Port Object
-    port_entries = []
-    if o365["tcp_ports"]:
-        port_entries.append(f"tcp:{','.join(o365['tcp_ports'])}")
-    if o365["udp_ports"]:
-        port_entries.append(f"udp:{','.join(o365['udp_ports'])}")
-
-    port_group_id = ztb.upsert_group(
-        name="O365-Required-Ports",
-        group_type="l4port",
-        member_attributes={"port_group": port_entries},
-    )
-
-    # 4. Provision Security Policy (Upsert with conflict avoidance)
-    ztb.create_security_policy(
-        name="Allow-O365-Direct",
-        src_ids=[SRC_GROUP_ID],
-        dst_ids=[ip_group_id, fqdn_group_id],
-        port_group_id=port_group_id,
-        site_id=SITE_ID,
-    )
+    print("\n[SUCCESS] Synchronization complete. Master groups contain only member groups.")
 
 
 if __name__ == "__main__":
